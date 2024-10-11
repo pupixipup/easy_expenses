@@ -5,6 +5,7 @@ package main
 // TODO: Error handling with status codes
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -14,12 +15,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	// "github.com/xuri/excelize/v2"
 	"os/exec"
 
 	"github.com/joho/godotenv"
+	"github.com/xuri/excelize/v2"
 )
 
 var categories = []string{"Mobile Phone", "Transport", "Gym card or wellness"}
@@ -162,6 +165,16 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 			receipts = append(receipts, info)
 		}
 	}
+
+	tableName, err := makeTable(receipts)
+	if err != nil {
+		http.Error(w, "Cant create xlsx table", http.StatusInternalServerError)
+	}
+	path, err := makeZip(receipts, tableName)
+	if err != nil {
+		http.Error(w, "Cant create zip", http.StatusInternalServerError)
+	}
+	fmt.Println(path)
 	fmt.Println(receipts, "Receipts")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(str))
@@ -172,6 +185,87 @@ type UploadResponse struct {
 	Filename string `json:"filename"`
 	Status   string `json:"status"`
 	Id       string `json:"id"`
+}
+
+func makeZip(receipts []ReceiptInfo, tablePath string) (string, error) {
+	// Create a new zip file
+	pathZip := "output.zip"
+	zipFile, err := os.Create("output.zip")
+	if err != nil {
+		return "", err
+	}
+	defer zipFile.Close()
+
+	// Create a new zip writer
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	// Add receipts
+	for _, receipt := range receipts {
+		file, err := os.Open(receipt.path)
+		name := filepath.Base(receipt.path)
+		if err != nil {
+			return "", err
+		}
+		fileWriter, err := zipWriter.Create(name)
+		if err != nil {
+			return "", err
+		}
+		_, err = io.Copy(fileWriter, file)
+		if err != nil {
+			return "", err
+		}
+		file.Close()
+	}
+	// Add table
+	file, err := os.Open(tablePath)
+	if err != nil {
+		return "", err
+	}
+	name := filepath.Base(tablePath)
+	fileWriter, err := zipWriter.Create(name)
+	if err != nil {
+		return "", err
+	}
+	_, err = io.Copy(fileWriter, file)
+	file.Close()
+
+	fmt.Println("Successfully created zip file with a file inside!")
+	return pathZip, nil
+}
+
+func makeTable(receipts []ReceiptInfo) (string, error) {
+	filePath := "Book1.xlsx"
+	f := excelize.NewFile()
+	defer func() {
+		if err := f.Close(); err != nil {
+			fmt.Println(err)
+		}
+	}()
+	// Set value of a cell.
+	f.SetCellValue("Sheet1", "A2", "Utläggsräkning")
+	f.SetCellValue("Sheet1", "A3", "Namn:")
+	f.SetCellValue("Sheet1", "B3", "Romas Bitinas")
+
+	f.SetCellValue("Sheet1", "A5", "Bolag")
+	f.SetCellValue("Sheet1", "B5", "Type")
+	f.SetCellValue("Sheet1", "C5", "Date")
+	f.SetCellValue("Sheet1", "D5", "Cost")
+	index := 6
+	for i, receipt := range receipts {
+		cellNum := strconv.Itoa(i + index)
+		f.SetCellValue("Sheet1", "A"+cellNum, receipt.CompanyName)
+		f.SetCellValue("Sheet1", "B"+cellNum, receipt.Category)
+		f.SetCellValue("Sheet1", "C"+cellNum, receipt.Date)
+		f.SetCellValue("Sheet1", "D"+cellNum, receipt.Cost)
+	}
+
+	// Set active sheet of the workbook.
+	// Save spreadsheet by the given path.
+	if err := f.SaveAs(filePath); err != nil {
+		fmt.Println(err)
+	}
+	return filePath, nil
 }
 
 func fetchData(base64 string) (*ReceiptInfo, error) {
@@ -186,7 +280,7 @@ func fetchData(base64 string) (*ReceiptInfo, error) {
 					{
 						"type": "text",
 						"text": `Return JSON with the following format: {cost: number, company_name: string, category: string, date: string}.
-						"cost" is amount to be paid, based on the receipt.
+						"cost" is total cost to be paid, based on the receipt.
 						"company_name" is a name of the company.
 						"date" is a date of the receipt.
 						Date should be formatted as "DD-MM-YYYY"
