@@ -1,7 +1,6 @@
 package main
 
-// TODO: Make XLSX table
-// TODO: Zip all files & send zip to user
+// TODO: Clean up files after request
 // TODO: Error handling with status codes
 
 import (
@@ -14,18 +13,15 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	// "github.com/xuri/excelize/v2"
-	"os/exec"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/xuri/excelize/v2"
 )
-
-var categories = []string{"Mobile Phone", "Transport", "Gym card or wellness"}
 
 type Global struct {
 	dirname string
@@ -42,12 +38,12 @@ type ReceiptInfo struct {
 var global Global
 
 func main() {
-	// f := excelize.NewFile()
-	dirname, err := os.MkdirTemp("", "uploads")
+	err := os.Mkdir("uploads", 0755)
 	if err != nil {
 		fmt.Println("Error creating temp dir")
 		return
 	}
+	dirname := "uploads"
 	global.dirname = dirname
 	err = godotenv.Load()
 	if err != nil {
@@ -73,8 +69,6 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	// return
-
 	err := r.ParseMultipartForm(10 << 20) // 10MB
 	if err != nil {
 		fmt.Println("Could not parse")
@@ -84,20 +78,33 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	form := r.MultipartForm
 	files := form.File
 
-	str := ""
+	userName := ""
+	userNameValue, ok := form.Value["name"]
+	if !ok || len(userNameValue) < 1 {
+		userName = "Your name"
+	} else {
+		userName = userNameValue[0]
+	}
 
 	channel := make(chan ReceiptInfo, 10)
-	// var channels []chan ReceiptInfo
+	chanSize := 0
 
 	for _, fileHeaders := range files {
 		for _, fileHeader := range fileHeaders {
+			chanSize++
 			go func() {
 				savedFile, err := saveFile(fileHeader)
+				fmt.Println(savedFile, err)
+				if err != nil {
+					http.Error(w, err.message, err.code)
+					return
+				}
 				var base64String string
 				// PDF TO IMG ---------------------------
 				if savedFile.contentType == "application/pdf" {
 					outPath := filepath.Join(global.dirname, "output.jpg")
 					savedFile.extension = "jpg"
+					savedFile.contentType = "image/jpg"
 					cmd := exec.Command("convert",
 						"-verbose",
 						"-density", "150",
@@ -141,11 +148,9 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 					base64String = base64.StdEncoding.EncodeToString(bytes)
 				}
 
-				str = "data:image/" + savedFile.extension + ";base64," + base64String
-
 				// Analyze image
-				receiptInfo, fetchErr := fetchData(base64String)
-				if err != nil {
+				receiptInfo, fetchErr := fetchData(base64String, savedFile.contentType)
+				if fetchErr != nil {
 					http.Error(w, fetchErr.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -159,25 +164,27 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 
 	var receipts []ReceiptInfo
 
-	for _, fileHeaders := range files {
-		for range fileHeaders {
-			info := <-channel
-			receipts = append(receipts, info)
-		}
+	for i := 0; i < chanSize; i++ {
+		info := <-channel
+		receipts = append(receipts, info)
 	}
 
-	tableName, err := makeTable(receipts)
+	tablePath, err := makeTable(receipts, userName)
 	if err != nil {
 		http.Error(w, "Cant create xlsx table", http.StatusInternalServerError)
 	}
-	path, err := makeZip(receipts, tableName)
+	pathZip, err := makeZip(receipts, tablePath)
 	if err != nil {
 		http.Error(w, "Cant create zip", http.StatusInternalServerError)
 	}
-	fmt.Println(path)
+	fmt.Println(pathZip)
 	fmt.Println(receipts, "Receipts")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(str))
+	http.ServeFile(w, r, pathZip)
+
+	// Wipe the stuff
+	os.Remove(pathZip)
+	os.Remove(tablePath)
+	os.RemoveAll(global.dirname)
 }
 
 type UploadResponse struct {
@@ -189,7 +196,6 @@ type UploadResponse struct {
 
 func makeZip(receipts []ReceiptInfo, tablePath string) (string, error) {
 	// Create a new zip file
-	pathZip := "output.zip"
 	zipFile, err := os.Create("output.zip")
 	if err != nil {
 		return "", err
@@ -231,21 +237,21 @@ func makeZip(receipts []ReceiptInfo, tablePath string) (string, error) {
 	file.Close()
 
 	fmt.Println("Successfully created zip file with a file inside!")
-	return pathZip, nil
+	return zipFile.Name(), nil
 }
 
-func makeTable(receipts []ReceiptInfo) (string, error) {
-	filePath := "Book1.xlsx"
+func makeTable(receipts []ReceiptInfo, name string) (string, error) {
+	filePath := "expenses_" + getMonthYear() + ".xlsx"
 	f := excelize.NewFile()
 	defer func() {
 		if err := f.Close(); err != nil {
 			fmt.Println(err)
 		}
 	}()
-	// Set value of a cell.
+
 	f.SetCellValue("Sheet1", "A2", "Utläggsräkning")
 	f.SetCellValue("Sheet1", "A3", "Namn:")
-	f.SetCellValue("Sheet1", "B3", "Romas Bitinas")
+	f.SetCellValue("Sheet1", "B3", name)
 
 	f.SetCellValue("Sheet1", "A5", "Bolag")
 	f.SetCellValue("Sheet1", "B5", "Type")
@@ -260,7 +266,6 @@ func makeTable(receipts []ReceiptInfo) (string, error) {
 		f.SetCellValue("Sheet1", "D"+cellNum, receipt.Cost)
 	}
 
-	// Set active sheet of the workbook.
 	// Save spreadsheet by the given path.
 	if err := f.SaveAs(filePath); err != nil {
 		fmt.Println(err)
@@ -268,31 +273,33 @@ func makeTable(receipts []ReceiptInfo) (string, error) {
 	return filePath, nil
 }
 
-func fetchData(base64 string) (*ReceiptInfo, error) {
-
+func fetchData(base64 string, dataType string) (*ReceiptInfo, error) {
+	fmt.Println("TYPE: ", dataType)
 	// Create the request payload
 	payload := map[string]interface{}{
-		"model": "gpt-4o-mini",
+		"model": "gpt-4o", // gpt-4o-mini
 		"messages": []map[string]interface{}{
 			{
 				"role": "user",
 				"content": []map[string]interface{}{
 					{
 						"type": "text",
-						"text": `Return JSON with the following format: {cost: number, company_name: string, category: string, date: string}.
-						"cost" is total cost to be paid, based on the receipt.
+						"text": `
+						You are given an image of a receipt. It can be either in Swedish or English. Analyze it thoroughly and 
+						return JSON with the following format: {cost: number, company_name: string, category: string, date: string}.
+						"cost" is total cost (in Swedish kronor).
 						"company_name" is a name of the company.
 						"date" is a date of the receipt.
-						Date should be formatted as "DD-MM-YYYY"
-						"category" belongs to enum ["SL Card", "Mobile", "Gym or wellness"]
-						If you can't identify any value, set it to empty string for strings,
-						And to zero for numbers
+						Date should be formatted as "DD-MM-YYYY".
+						"category" belongs to enum ["SL Card", "Mobile", "Fitness"].
 						`,
+						// If you can't identify any value, set it to empty string for strings,
+						// And to zero for numbers.
 					},
 					{
 						"type": "image_url",
 						"image_url": map[string]interface{}{
-							"url": "data:image/jpg;base64," + base64,
+							"url": "data:" + dataType + ";base64," + base64,
 						},
 					},
 				},
@@ -445,4 +452,15 @@ func saveFile(fileHeader *multipart.FileHeader) (*FileSave, *ResError) {
 		file,
 		dst,
 	}, nil
+}
+
+func getMonthYear() string {
+	currentTime := time.Now()
+
+	month := currentTime.Format("Jan")
+	monthLower := month[:3]
+
+	year := currentTime.Format("2006")
+
+	return fmt.Sprintf("%s%s", monthLower, year)
 }
