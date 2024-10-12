@@ -6,6 +6,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -31,6 +33,7 @@ type ReceiptInfo struct {
 	CompanyName string `json:"company_name"`
 	Date        string `json:"date"`
 	Cost        int    `json:"cost"`
+	RawCost     int    `json:"raw_cost_text"`
 	Category    string `json:"category"`
 	path        string
 }
@@ -38,17 +41,15 @@ type ReceiptInfo struct {
 var global Global
 
 func main() {
-	err := os.Mkdir("uploads", 0755)
-	if err != nil {
-		fmt.Println("Error creating temp dir")
-		return
-	}
 	dirname := "uploads"
 	global.dirname = dirname
+	err := os.Mkdir(global.dirname, 0755)
+	if err != nil {
+		panic("Error creating temp dir")
+	}
 	err = godotenv.Load()
 	if err != nil {
-		fmt.Println("Error loading .env file")
-		return
+		panic("Error loading .env file")
 	}
 
 	http.HandleFunc("/", uploadFile)
@@ -71,7 +72,6 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 
 	err := r.ParseMultipartForm(10 << 20) // 10MB
 	if err != nil {
-		fmt.Println("Could not parse")
 		http.Error(w, "Could not parse multipart form", http.StatusBadRequest)
 		return
 	}
@@ -86,17 +86,25 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		userName = userNameValue[0]
 	}
 
-	channel := make(chan ReceiptInfo, 10)
+	// Parallel requests
+	var wg sync.WaitGroup
 	chanSize := 0
 
+	var receipts []ReceiptInfo
+	// Create a context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Channel to capture the first error
+	errorChan := make(chan *ResError, 1)
 	for _, fileHeaders := range files {
 		for _, fileHeader := range fileHeaders {
 			chanSize++
+			wg.Add(1)
 			go func() {
+
 				savedFile, err := saveFile(fileHeader)
-				fmt.Println(savedFile, err)
 				if err != nil {
-					http.Error(w, err.message, err.code)
+					errorChan <- err
 					return
 				}
 				var base64String string
@@ -118,31 +126,41 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 					// Run the command and capture any errors
 					err := cmd.Run()
 					if err != nil {
-						fmt.Println(err)
+						errorChan <- &ResError{
+							err.Error(),
+							http.StatusInternalServerError,
+						}
+						return
 					}
 
 					file, err := os.Open(outPath)
 					if err != nil {
-						http.Error(w, "Error when opening image", http.StatusInternalServerError)
+						errorChan <- &ResError{
+							"Error when opening image",
+							http.StatusInternalServerError,
+						}
 						return
 					}
 					fileBytes, err := io.ReadAll(file)
 					file.Close()
 					if err != nil {
-						fmt.Println(err, "1")
-						http.Error(w, "Error when encoding image", http.StatusInternalServerError)
+						errorChan <- &ResError{
+							"Error when encoding image",
+							http.StatusInternalServerError,
+						}
 						return
 					}
 
 					base64String = base64.StdEncoding.EncodeToString(fileBytes)
 
-					fmt.Println("PDF successfully converted to PNG!")
 				} else {
 					savedFile.fetchedFile.Seek(0, 0)
 					bytes, err := io.ReadAll(savedFile.fetchedFile)
 					if err != nil {
-						fmt.Println(err, "2")
-						http.Error(w, "Error when encoding image", http.StatusInternalServerError)
+						errorChan <- &ResError{
+							"Error when encoding image",
+							http.StatusInternalServerError,
+						}
 						return
 					}
 					base64String = base64.StdEncoding.EncodeToString(bytes)
@@ -155,36 +173,47 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				receiptInfo.path = savedFile.path
-				channel <- *receiptInfo
+				receipts = append(receipts, *receiptInfo)
+				// HERE
 				savedFile.savedFile.Close()
 				savedFile.fetchedFile.Close()
+
+				wg.Done()
 			}()
 		}
 	}
 
-	var receipts []ReceiptInfo
+	go func() {
+		wg.Wait()
+		cancel()
+	}()
 
-	for i := 0; i < chanSize; i++ {
-		info := <-channel
-		receipts = append(receipts, info)
+	select {
+	case err := <-errorChan:
+		http.Error(w, err.message, err.code)
+		return
+	case <-ctx.Done():
 	}
+
+	fmt.Println("All receipts: ", receipts)
 
 	tablePath, err := makeTable(receipts, userName)
 	if err != nil {
 		http.Error(w, "Cant create xlsx table", http.StatusInternalServerError)
+		return
 	}
 	pathZip, err := makeZip(receipts, tablePath)
 	if err != nil {
 		http.Error(w, "Cant create zip", http.StatusInternalServerError)
+		return
 	}
-	fmt.Println(pathZip)
-	fmt.Println(receipts, "Receipts")
 	http.ServeFile(w, r, pathZip)
 
 	// Wipe the stuff
 	os.Remove(pathZip)
 	os.Remove(tablePath)
 	os.RemoveAll(global.dirname)
+	os.Mkdir(global.dirname, 0755)
 }
 
 type UploadResponse struct {
@@ -236,18 +265,12 @@ func makeZip(receipts []ReceiptInfo, tablePath string) (string, error) {
 	_, err = io.Copy(fileWriter, file)
 	file.Close()
 
-	fmt.Println("Successfully created zip file with a file inside!")
 	return zipFile.Name(), nil
 }
 
 func makeTable(receipts []ReceiptInfo, name string) (string, error) {
 	filePath := "expenses_" + getMonthYear() + ".xlsx"
 	f := excelize.NewFile()
-	defer func() {
-		if err := f.Close(); err != nil {
-			fmt.Println(err)
-		}
-	}()
 
 	f.SetCellValue("Sheet1", "A2", "Utläggsräkning")
 	f.SetCellValue("Sheet1", "A3", "Namn:")
@@ -268,13 +291,13 @@ func makeTable(receipts []ReceiptInfo, name string) (string, error) {
 
 	// Save spreadsheet by the given path.
 	if err := f.SaveAs(filePath); err != nil {
-		fmt.Println(err)
+		return "", err
 	}
-	return filePath, nil
+	err := f.Close()
+	return filePath, err
 }
 
 func fetchData(base64 string, dataType string) (*ReceiptInfo, error) {
-	fmt.Println("TYPE: ", dataType)
 	// Create the request payload
 	payload := map[string]interface{}{
 		"model": "gpt-4o", // gpt-4o-mini
@@ -285,16 +308,25 @@ func fetchData(base64 string, dataType string) (*ReceiptInfo, error) {
 					{
 						"type": "text",
 						"text": `
-						You are given an image of a receipt. It can be either in Swedish or English. Analyze it thoroughly and 
-						return JSON with the following format: {cost: number, company_name: string, category: string, date: string}.
-						"cost" is total cost (in Swedish kronor).
-						"company_name" is a name of the company.
-						"date" is a date of the receipt.
-						Date should be formatted as "DD-MM-YYYY".
-						"category" belongs to enum ["SL Card", "Mobile", "Fitness"].
+						You are given an image of a receipt. It can be either in Swedish or English. Analyze the receipt image thoroughly and 
+						return JSON with the following format: 
+						{
+							company_name: string,
+							cost: number,
+							raw_cost_text: string,
+							category: string,
+							date: string
+						}
+						- "company_name" is a name of the company.
+						- "cost" is total cost (sometimes has currency such SEK or kr and often labeled with "Totalt", "Summa", or "Att betala"). The cost is important, please pay attention to it.
+						- "raw_cost_text" is the exact text you see for the cost before parsing it into a number.
+						- "date" is a date of the receipt. Date should be formatted as "DD-MM-YYYY".
+						- "category" belongs to enum ["SL Card", "Mobile", "Fitness"].
+
+						If you can't identify any value, set it to an empty string for strings, and to zero for numbers. However, please look meticulously, as the receipt usually contains all the fields.
+
+						Examples of possible cost formats: "150.00", "1.234,56", "2 345,67 kr", "500 SEK", "150:-"
 						`,
-						// If you can't identify any value, set it to empty string for strings,
-						// And to zero for numbers.
 					},
 					{
 						"type": "image_url",
@@ -444,7 +476,6 @@ func saveFile(fileHeader *multipart.FileHeader) (*FileSave, *ResError) {
 	// str = base64String
 	// Copy the uploaded file data to the server's file
 	_, err = io.Copy(dst, file)
-	fmt.Println(contentType)
 	return &FileSave{
 		path,
 		extension,
