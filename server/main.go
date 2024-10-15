@@ -1,8 +1,5 @@
 package main
 
-// TODO: Clean up files after request
-// TODO: Error handling with status codes
-
 import (
 	"archive/zip"
 	"bytes"
@@ -25,9 +22,9 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-type Global struct {
-	dirname string
-}
+const dirname = "uploads"
+
+var mu = sync.Mutex{}
 
 type ReceiptInfo struct {
 	CompanyName string `json:"company_name"`
@@ -38,12 +35,40 @@ type ReceiptInfo struct {
 	path        string
 }
 
-var global Global
+type CompletionResponse struct {
+	Choices []Choice `json:"choices"`
+	Created float64  `json:"created"`
+	ID      string   `json:"id"`
+}
+
+type Choice struct {
+	FinishReason string  `json:"finish_reason"`
+	Index        int     `json:"index"`
+	Logprobs     *string `json:"logprobs"`
+	Message      Message `json:"message"`
+}
+
+type Message struct {
+	Content string  `json:"content"`
+	Refusal *string `json:"refusal"`
+	Role    string  `json:"role"`
+}
+
+type ResError struct {
+	message string
+	code    int
+}
+
+type FileSave struct {
+	path        string
+	extension   string
+	contentType string
+	fetchedFile multipart.File
+	savedFile   *os.File
+}
 
 func main() {
-	dirname := "uploads"
-	global.dirname = dirname
-	err := os.Mkdir(global.dirname, 0755)
+	err := os.Mkdir(dirname, 0755)
 	if err != nil {
 		panic("Error creating temp dir")
 	}
@@ -66,6 +91,7 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Playground settings (Not intended to be used other than locally)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -86,12 +112,10 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		userName = userNameValue[0]
 	}
 
-	// Parallel requests
 	var wg sync.WaitGroup
 	chanSize := 0
 
 	var receipts []ReceiptInfo
-	// Create a context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Channel to capture the first error
@@ -100,86 +124,7 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		for _, fileHeader := range fileHeaders {
 			chanSize++
 			wg.Add(1)
-			go func() {
-
-				savedFile, err := saveFile(fileHeader)
-				if err != nil {
-					errorChan <- err
-					return
-				}
-				var base64String string
-				// PDF TO IMG ---------------------------
-				if savedFile.contentType == "application/pdf" {
-					outPath := filepath.Join(global.dirname, "output.jpg")
-					savedFile.extension = "jpg"
-					savedFile.contentType = "image/jpg"
-					cmd := exec.Command("convert",
-						"-verbose",
-						"-density", "150",
-						"-trim",
-						savedFile.path+"[0]",
-						"-quality", "100",
-						"-flatten",
-						"-sharpen", "0x1.0",
-						outPath,
-					)
-					// Run the command and capture any errors
-					err := cmd.Run()
-					if err != nil {
-						errorChan <- &ResError{
-							err.Error(),
-							http.StatusInternalServerError,
-						}
-						return
-					}
-
-					file, err := os.Open(outPath)
-					if err != nil {
-						errorChan <- &ResError{
-							"Error when opening image",
-							http.StatusInternalServerError,
-						}
-						return
-					}
-					fileBytes, err := io.ReadAll(file)
-					file.Close()
-					if err != nil {
-						errorChan <- &ResError{
-							"Error when encoding image",
-							http.StatusInternalServerError,
-						}
-						return
-					}
-
-					base64String = base64.StdEncoding.EncodeToString(fileBytes)
-
-				} else {
-					savedFile.fetchedFile.Seek(0, 0)
-					bytes, err := io.ReadAll(savedFile.fetchedFile)
-					if err != nil {
-						errorChan <- &ResError{
-							"Error when encoding image",
-							http.StatusInternalServerError,
-						}
-						return
-					}
-					base64String = base64.StdEncoding.EncodeToString(bytes)
-				}
-
-				// Analyze image
-				receiptInfo, fetchErr := fetchData(base64String, savedFile.contentType)
-				if fetchErr != nil {
-					http.Error(w, fetchErr.Error(), http.StatusInternalServerError)
-					return
-				}
-				receiptInfo.path = savedFile.path
-				receipts = append(receipts, *receiptInfo)
-				// HERE
-				savedFile.savedFile.Close()
-				savedFile.fetchedFile.Close()
-
-				wg.Done()
-			}()
+			go processReceipt(fileHeader, errorChan, &wg, &receipts)
 		}
 	}
 
@@ -204,6 +149,7 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	pathZip, err := makeZip(receipts, tablePath)
 	if err != nil {
+		fmt.Println(err, "error1")
 		http.Error(w, "Cant create zip", http.StatusInternalServerError)
 		return
 	}
@@ -212,8 +158,8 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	// Wipe the stuff
 	os.Remove(pathZip)
 	os.Remove(tablePath)
-	os.RemoveAll(global.dirname)
-	os.Mkdir(global.dirname, 0755)
+	os.RemoveAll(dirname)
+	os.Mkdir(dirname, 0755)
 }
 
 type UploadResponse struct {
@@ -236,6 +182,7 @@ func makeZip(receipts []ReceiptInfo, tablePath string) (string, error) {
 	defer zipWriter.Close()
 
 	// Add receipts
+	fmt.Println(receipts, "Receipts")
 	for _, receipt := range receipts {
 		file, err := os.Open(receipt.path)
 		name := filepath.Base(receipt.path)
@@ -252,7 +199,6 @@ func makeZip(receipts []ReceiptInfo, tablePath string) (string, error) {
 		}
 		file.Close()
 	}
-	// Add table
 	file, err := os.Open(tablePath)
 	if err != nil {
 		return "", err
@@ -289,7 +235,6 @@ func makeTable(receipts []ReceiptInfo, name string) (string, error) {
 		f.SetCellValue("Sheet1", "D"+cellNum, receipt.Cost)
 	}
 
-	// Save spreadsheet by the given path.
 	if err := f.SaveAs(filePath); err != nil {
 		return "", err
 	}
@@ -300,7 +245,7 @@ func makeTable(receipts []ReceiptInfo, name string) (string, error) {
 func fetchData(base64 string, dataType string) (*ReceiptInfo, error) {
 	// Create the request payload
 	payload := map[string]interface{}{
-		"model": "gpt-4o", // gpt-4o-mini
+		"model": "gpt-4o", // OR gpt-4o-mini
 		"messages": []map[string]interface{}{
 			{
 				"role": "user",
@@ -381,64 +326,6 @@ func fetchData(base64 string, dataType string) (*ReceiptInfo, error) {
 	return nil, fmt.Errorf("Error: %s\n", resp.Status)
 }
 
-// Type representing the overall structure
-type CompletionResponse struct {
-	Choices           []Choice `json:"choices"`
-	Created           float64  `json:"created"`
-	ID                string   `json:"id"`
-	Model             string   `json:"model"`
-	Object            string   `json:"object"`
-	SystemFingerprint string   `json:"system_fingerprint"`
-	Usage             Usage    `json:"usage"`
-}
-
-// Nested type representing choices
-type Choice struct {
-	FinishReason string  `json:"finish_reason"`
-	Index        int     `json:"index"`
-	Logprobs     *string `json:"logprobs"` // Since logprobs is <nil> in your JSON, using a pointer here
-	Message      Message `json:"message"`
-}
-
-// Nested type representing the message field
-type Message struct {
-	Content string  `json:"content"`
-	Refusal *string `json:"refusal"` // Since refusal is <nil> in your JSON, using a pointer
-	Role    string  `json:"role"`
-}
-
-// Nested type representing the usage field
-type Usage struct {
-	CompletionTokens        int               `json:"completion_tokens"`
-	CompletionTokensDetails CompletionDetails `json:"completion_tokens_details"`
-	PromptTokens            int               `json:"prompt_tokens"`
-	PromptTokensDetails     PromptDetails     `json:"prompt_tokens_details"`
-	TotalTokens             int               `json:"total_tokens"`
-}
-
-// Nested type representing completion tokens details
-type CompletionDetails struct {
-	ReasoningTokens int `json:"reasoning_tokens"`
-}
-
-// Nested type representing prompt tokens details
-type PromptDetails struct {
-	CachedTokens int `json:"cached_tokens"`
-}
-
-type ResError struct {
-	message string
-	code    int
-}
-
-type FileSave struct {
-	path        string
-	extension   string
-	contentType string
-	fetchedFile multipart.File
-	savedFile   *os.File
-}
-
 func saveFile(fileHeader *multipart.FileHeader) (*FileSave, *ResError) {
 	// Open the file
 	contentType := fileHeader.Header.Get("Content-Type")
@@ -451,8 +338,7 @@ func saveFile(fileHeader *multipart.FileHeader) (*FileSave, *ResError) {
 	}
 	defer file.Close()
 
-	// Create the destination file on the server
-	path := filepath.Join(global.dirname, fileHeader.Filename)
+	path := filepath.Join(dirname, fileHeader.Filename)
 	extension := strings.Replace(filepath.Ext(fileHeader.Filename), ".", "", 1)
 	dst, err := os.Create(path)
 
@@ -464,7 +350,6 @@ func saveFile(fileHeader *multipart.FileHeader) (*FileSave, *ResError) {
 	}
 
 	_, err = io.Copy(dst, file)
-	// Read the file content
 	if err != nil {
 		return nil, &ResError{
 			"Unable to read file",
@@ -472,9 +357,6 @@ func saveFile(fileHeader *multipart.FileHeader) (*FileSave, *ResError) {
 		}
 	}
 
-	// Encode the file content to Base64
-	// str = base64String
-	// Copy the uploaded file data to the server's file
 	_, err = io.Copy(dst, file)
 	return &FileSave{
 		path,
@@ -494,4 +376,94 @@ func getMonthYear() string {
 	year := currentTime.Format("2006")
 
 	return fmt.Sprintf("%s%s", monthLower, year)
+}
+
+func pdfToJpg(path string) (string, error) {
+	outPath := filepath.Join(dirname, "output.jpg")
+	cmd := exec.Command("convert",
+		"-verbose",
+		"-density", "150",
+		"-trim",
+		path+"[0]",
+		"-quality", "100",
+		"-flatten",
+		"-sharpen", "0x1.0",
+		outPath,
+	)
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+	return outPath, nil
+}
+
+func fileToBase64(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", nil
+	}
+	fileBytes, err := io.ReadAll(file)
+	file.Close()
+	return base64.StdEncoding.EncodeToString(fileBytes), nil
+}
+
+func processReceipt(fileHeader *multipart.FileHeader, errorChan chan *ResError, wg *sync.WaitGroup, receipts *[]ReceiptInfo) {
+	savedFile, err := saveFile(fileHeader)
+
+	if err != nil {
+		errorChan <- err
+		return
+	}
+	var base64String string
+	if savedFile.contentType == "application/pdf" {
+		outPath, err := pdfToJpg(savedFile.path)
+		if err != nil {
+			errorChan <- &ResError{
+				"Error during PDF handling",
+				http.StatusInternalServerError,
+			}
+			return
+		}
+		savedFile.extension = "jpg"
+		savedFile.contentType = "image/jpg"
+		encodedStr, err := fileToBase64(outPath)
+		if err != nil {
+			errorChan <- &ResError{
+				"Error during base64 conversion",
+				http.StatusInternalServerError,
+			}
+			return
+		}
+		base64String = encodedStr
+	} else {
+		savedFile.fetchedFile.Seek(0, 0)
+		bytes, err := io.ReadAll(savedFile.fetchedFile)
+		if err != nil {
+			errorChan <- &ResError{
+				"Error when encoding image",
+				http.StatusInternalServerError,
+			}
+			return
+		}
+		base64String = base64.StdEncoding.EncodeToString(bytes)
+	}
+
+	// Analyze image
+	receiptInfo, fetchErr := fetchData(base64String, savedFile.contentType)
+
+	if fetchErr != nil {
+		errorChan <- &ResError{
+			"Could not fetch from openAI API",
+			http.StatusInternalServerError,
+		}
+		return
+	}
+	savedFile.savedFile.Close()
+	savedFile.fetchedFile.Close()
+
+	receiptInfo.path = savedFile.path
+	mu.Lock()
+	*receipts = append(*receipts, *receiptInfo)
+	mu.Unlock()
+	wg.Done()
 }
