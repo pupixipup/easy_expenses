@@ -2,7 +2,7 @@
 A simple full-stack app for converting pdf or image receipts to xlsx table.
 This is the process:
 1. Go server receives images or pdfs of receipts from the client
-2. The receipts are analyzed with OpenAI API
+2. The receipts are analyzed with OpenAI API (receipt is categorized; price, date and company are identified)
 3. XLSX table based on the analyzed data is created
 4. Table and receipts get zipped and sent to a client as a response
 
